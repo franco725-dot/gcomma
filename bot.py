@@ -40,27 +40,32 @@ def send_message(chat_id, text):
     except Exception as e:
         print(f"[-] Error enviando mensaje: {e}")
 
-def ask_gemini(user_message, user_name="Franco"):
-    try:
-        chat_history.append(f"{user_name}: {user_message}")
-        recent_context = "\n".join(chat_history[-10:])
-        prompt = f"Contexto de la conversación:\n{recent_context}\n\nResponde a {user_name}."
+MODELS_TO_TRY = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
 
-        response = gemini_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.8,
-                max_output_tokens=600
+def ask_gemini(user_message, user_name="Franco"):
+    chat_history.append(f"{user_name}: {user_message}")
+    recent_context = "\n".join(chat_history[-10:])
+    prompt = f"Contexto de la conversación:\n{recent_context}\n\nResponde a {user_name}."
+
+    for model_name in MODELS_TO_TRY:
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.8,
+                    max_output_tokens=600
+                )
             )
-        )
-        reply = response.text
-        chat_history.append(f"GComma: {reply}")
-        return reply
-    except Exception as e:
-        print(f"[-] Error Gemini: {e}")
-        return f"Ups, me dio un pequeño mareo pensando: {e}"
+            reply = response.text
+            chat_history.append(f"GComma: {reply}")
+            return reply
+        except Exception as e:
+            print(f"[-] Error con modelo {model_name}: {e}")
+            continue
+
+    return "Oye hermano, me quedé sin energía por unos minutos (límite de consultas diarias de Google). ¡Dame un ratito de descanso o prueba de nuevo en un rato!"
 
 # Servidor HTTP para Render/Koyeb (mantiene el bot activo 24/7)
 class HealthCheckHandler(BaseHTTPRequestHandler):
