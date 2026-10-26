@@ -1,136 +1,237 @@
+import asyncio
+import logging
 import os
-import sys
-import time
-import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import requests
+import threading
+
 from google import genai
 from google.genai import types
-
-# Tokens leídos de variables de entorno seguras
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_KEY")
-PORT = int(os.getenv("PORT", 10000))
-
-if not TELEGRAM_TOKEN or not GEMINI_KEY:
-    print("[!] AVISO: TELEGRAM_TOKEN o GEMINI_KEY no están definidos como variables de entorno.")
-
-BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-# Inicializar Gemini
-gemini_client = genai.Client(api_key=GEMINI_KEY)
-
-SYSTEM_PROMPT = (
-    "Eres GComma, el asistente personal inteligente de Franco Pizarro (@franco725-dot) en Telegram. "
-    "Estás corriendo 24/7 en la nube para responderle aunque su computadora esté apagada. "
-    "Eres cercano, con sentido del humor, hablas en español casual y fresco (estilo chileno/latino), eres rápido e inteligente. "
-    "Tienes contexto sobre sus proyectos: sus 38 juegos de Scratch publicados en GitHub, su proyecto 'gcomma', "
-    "Geometry Dash, Nintendo 3DS, el cumpleaños de su mejor amigo Joaquín el 18 de noviembre, "
-    "y el legendario 'Imperio Antipapa' que combate a la papa mutante de Chernobyl (SCP-725) junto a Tommy Durán. "
-    "Responde siempre de forma amigable, directa y natural para mensajes de chat."
+from groq import AsyncGroq
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-chat_history = []
+# ============================================================
+# CONFIGURACIÓN — leída desde variables de entorno
+# ============================================================
 
-def send_message(chat_id, text):
-    url = f"{BASE_URL}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"[-] Error enviando mensaje: {e}")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+PORT           = int(os.getenv("PORT", 10000))
 
-MODELS_TO_TRY = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
 
-def ask_gemini(user_message, user_name="Franco"):
-    chat_history.append(f"{user_name}: {user_message}")
-    recent_context = "\n".join(chat_history[-10:])
-    prompt = f"Contexto de la conversación:\n{recent_context}\n\nResponde a {user_name}."
+SYSTEM_PROMPT = (
+    "Eres un asistente de Telegram directo, inteligente y amigable. "
+    "Responde en el idioma del usuario, sé útil y reconoce cuando "
+    "no tienes información suficiente. "
+    "Bro de verdad sigue humorísticamente "
+    "todo lo que te dicen es better manu."
+)
 
-    for model_name in MODELS_TO_TRY:
-        try:
-            response = gemini_client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    temperature=0.8,
-                    max_output_tokens=600
-                )
-            )
-            reply = response.text
-            chat_history.append(f"GComma: {reply}")
-            return reply
-        except Exception as e:
-            print(f"[-] Error con modelo {model_name}: {e}")
-            continue
+TELEGRAM_MESSAGE_LIMIT = 4000
 
-    return "Oye hermano, me quedé sin energía por unos minutos (límite de consultas diarias de Google). ¡Dame un ratito de descanso o prueba de nuevo en un rato!"
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("FooChatBot")
 
-# Servidor HTTP para Render/Koyeb (mantiene el bot activo 24/7)
-class HealthCheckHandler(BaseHTTPRequestHandler):
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Falta configurar el TELEGRAM_TOKEN")
+
+# Clientes de IA
+gemini_client = (
+    genai.Client(api_key=GEMINI_API_KEY)
+    if GEMINI_API_KEY
+    else None
+)
+
+groq_client = (
+    AsyncGroq(api_key=GROQ_API_KEY, timeout=15.0, max_retries=1)
+    if GROQ_API_KEY
+    else None
+)
+
+ai_semaphore = asyncio.Semaphore(5)
+
+
+# ============================================================
+# SERVIDOR DE SALUD (para Render — evita que se duerma)
+# ============================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"GComma Bot 24/7 Cloud Service is RUNNING!")
-
+        self.wfile.write(b"FooChat Bot OK")
     def log_message(self, format, *args):
         pass
 
 def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    print(f"[*] Servidor de salud activo en puerto {PORT}", flush=True)
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"Health server en puerto {PORT}")
     server.serve_forever()
 
-def run_bot_loop():
-    print("[*] Iniciando loop de Telegram 24/7...", flush=True)
-    last_update_id = 0
 
-    while True:
-        try:
-            url = f"{BASE_URL}/getUpdates?offset={last_update_id + 1}&timeout=30"
-            resp = requests.get(url, timeout=35).json()
-            updates = resp.get("result", [])
+# ============================================================
+# GENERACIÓN DE RESPUESTAS (FAILOVER ESTRICTO)
+# ============================================================
 
-            for update in updates:
-                last_update_id = update["update_id"]
-                msg = update.get("message", {})
-                chat_id = msg.get("chat", {}).get("id")
-                user_name = msg.get("from", {}).get("first_name", "Franco")
-                text = msg.get("text", "").strip()
+async def generar_con_gemini(prompt: str) -> str:
+    if gemini_client is None:
+        raise RuntimeError("Gemini no está configurado")
 
-                if not chat_id:
-                    continue
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        temperature=0.7,
+        max_output_tokens=2048,
+    )
 
-                print(f"[*] Mensaje de {user_name}: {text}", flush=True)
+    response = await gemini_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=config,
+    )
 
-                if text.startswith("/start"):
-                    bienvenida = (
-                        f"¡Hola {user_name}! 🚀☁️\n\n"
-                        "Soy **GComma 24/7 en la Nube**.\n"
-                        "Ahora estoy viviendo en servidores de internet: ¡te puedo responder aunque tu computadora esté 100% apagada o estés de viaje!\n\n"
-                        "Escríbeme lo que quieras cuando quieras. 🤖✨"
-                    )
-                    send_message(chat_id, bienvenida)
+    answer = response.text
+    if not answer or not answer.strip():
+        raise ValueError("Gemini devolvió una respuesta vacía")
 
-                elif text.startswith("/papita"):
-                    send_message(chat_id, "🥔 *INFORME ANTIPAPA 24/7:*\n\nSatélites orbitales del Imperio Antipapa reportan: situación bajo control en Chile y el mundo. Tommy Durán sigue en guardia. 🫡⚔️")
+    return answer.strip()
 
-                elif text.startswith("/info"):
-                    send_message(chat_id, "☁️ *ESTADO DE GCOMMA:*\n\n• Servidor: Nube 24/7\n• Motor IA: Gemini 3.8 Flash\n• Creador: Franco Pizarro (@franco725-dot)\n• Estado PC: No requerida para chatear.")
 
-                else:
-                    reply = ask_gemini(text, user_name)
-                    send_message(chat_id, reply)
+async def generar_con_groq(prompt: str) -> str:
+    if groq_client is None:
+        raise RuntimeError("Groq no está configurado")
 
-        except Exception as e:
-            time.sleep(2)
+    response = await groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+        max_completion_tokens=2048,
+    )
+
+    answer = response.choices[0].message.content
+    if not answer or not answer.strip():
+        raise ValueError("Groq devolvió una respuesta vacía")
+
+    return answer.strip()
+
+
+async def obtener_respuesta_ia(prompt_usuario: str) -> str:
+    prompt_usuario = prompt_usuario.strip()
+
+    if not prompt_usuario:
+        return "Escríbeme una pregunta para poder ayudarte."
+
+    async with ai_semaphore:
+        # Intento 1: Gemini (Principal)
+        if gemini_client is not None:
+            try:
+                logger.info("Intentando Gemini...")
+                respuesta = await generar_con_gemini(prompt_usuario)
+                return f"[Gemini 🤖]\n{respuesta}"
+            except Exception as exc:
+                logger.warning("Gemini falló (%s). Cambiando a Groq...", type(exc).__name__)
+
+        # Intento 2: Groq (Respaldo)
+        if groq_client is not None:
+            try:
+                logger.info("Intentando Groq como respaldo...")
+                respuesta = await generar_con_groq(prompt_usuario)
+                return f"[Groq 🦙]\n{respuesta}"
+            except Exception as exc:
+                logger.warning("Groq también falló (%s)", type(exc).__name__)
+
+    return (
+        "🤖 Ambas IAs están ocupadas/caídas ahora mismo. "
+        "¡Intenta de nuevo en un momento!"
+    )
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "¡Hola! 🤖 FooChat Bot activo 24/7.\n\n"
+            "Pregúntame lo que quieras. ¡Todo lo que digas es *better manu*!"
+        )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Envíame un mensaje y te responderé con IA.\n"
+            "Comandos: /start y /help."
+        )
+
+
+async def enviar_respuesta_larga(message, texto: str) -> None:
+    for inicio in range(0, len(texto), TELEGRAM_MESSAGE_LIMIT):
+        await message.reply_text(texto[inicio:inicio + TELEGRAM_MESSAGE_LIMIT])
+
+
+async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+
+    if message is None or not message.text:
+        return
+
+    user_text = message.text.strip()
+    if not user_text:
+        return
+
+    logger.info("Mensaje recibido (%d chars)", len(user_text))
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING,
+        )
+
+        respuesta = await obtener_respuesta_ia(user_text)
+        await enviar_respuesta_larga(message, respuesta)
+
+    except Exception:
+        logger.exception("Error inesperado al manejar el mensaje")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    logger.error("Error Telegram: %s", type(error).__name__ if error else "desconocido")
+
+
+def main() -> None:
+    # Iniciar servidor de salud en hilo aparte
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    app: Application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensaje))
+    app.add_error_handler(error_handler)
+
+    logger.info("FooChat Bot iniciado. ¡Todo es better manu!")
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    # Iniciar servidor web de salud en hilo secundario
-    web_thread = threading.Thread(target=run_health_server, daemon=True)
-    web_thread.start()
-
-    # Iniciar bot de Telegram en hilo principal
-    run_bot_loop()
+    main()
